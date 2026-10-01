@@ -1,0 +1,124 @@
+"use server";
+import { prismadb } from "@/lib/prisma";
+import { revalidatePath } from "next/cache";
+import { inngest } from "@/inngest/client";
+import { writeAuditLog, diffObjects } from "@/lib/audit-log";
+import { getSnapshotRate, getDefaultCurrency } from "@/lib/currency";
+import { handleStageTransition } from "@/lib/crm/stage-transition";
+import { qualifiedEntryBlockReason } from "@/lib/crm/approval-gate";
+import {
+  requireAuthenticated,
+  assertCanWriteOpportunity,
+  AuthenticationError,
+  AuthorizationError,
+} from "@/lib/authz";
+
+export const updateOpportunity = async (data: {
+  id: string;
+  account?: string;
+  assigned_to?: string;
+  budget?: string;
+  campaign?: string | null;
+  close_date?: Date;
+  delivery_deadline?: Date;
+  contact?: string;
+  currency?: string;
+  description?: string;
+  expected_revenue?: string;
+  name?: string;
+  next_step?: string;
+  sales_stage?: string;
+  type?: string;
+}) => {
+  const {
+    id,
+    account,
+    assigned_to,
+    budget,
+    campaign,
+    close_date,
+    delivery_deadline,
+    contact,
+    currency,
+    description,
+    expected_revenue,
+    name,
+    next_step,
+    sales_stage,
+    type,
+  } = data;
+
+  if (!id) return { error: "id is required" };
+
+  // Authorization runs before the approval gate and the update.
+  let user;
+  try {
+    user = await requireAuthenticated();
+  } catch (e) {
+    if (e instanceof AuthenticationError) return { error: "Unauthorized" };
+    throw e;
+  }
+  try {
+    await assertCanWriteOpportunity(user, id);
+  } catch (e) {
+    if (e instanceof AuthorizationError) return { error: "Forbidden" };
+    throw e;
+  }
+  const userId = user.id;
+
+  try {
+    const defaultCurrency = await getDefaultCurrency();
+    const snapshotRate = currency
+      ? await getSnapshotRate(currency, defaultCurrency)
+      : null;
+    const before = await prismadb.crm_Opportunities.findUnique({ where: { id, deletedAt: null } });
+    const blockReason = await qualifiedEntryBlockReason({
+      fromStage: before?.sales_stage ?? null,
+      toStage: sales_stage || null,
+      approvalStatus: before?.approval_status ?? "NONE",
+    });
+    if (blockReason) return { error: blockReason };
+    const opportunity = await prismadb.crm_Opportunities.update({
+      where: { id },
+      data: {
+        account: account || undefined,
+        assigned_to: assigned_to || undefined,
+        budget: budget ? parseFloat(budget) : undefined,
+        campaign: campaign || undefined,
+        close_date,
+        delivery_deadline,
+        contact: contact || undefined,
+        updatedBy: userId,
+        currency: currency || undefined,
+        description,
+        expected_revenue: expected_revenue ? parseFloat(expected_revenue) : undefined,
+        snapshot_rate: snapshotRate ? parseFloat(snapshotRate.toString()) : undefined,
+        name,
+        next_step,
+        sales_stage: sales_stage || undefined,
+        status: "ACTIVE",
+        type: type || undefined,
+      },
+    });
+    await handleStageTransition({
+      opportunityId: opportunity.id,
+      fromStage: before?.sales_stage ?? null,
+      toStage: opportunity.sales_stage ?? null,
+    });
+    const serialize = (obj: any) => JSON.parse(JSON.stringify(obj, (_, v) => typeof v === "bigint" ? v.toString() : v));
+    const changes = before ? diffObjects(serialize(before), serialize(opportunity)) : null;
+    await writeAuditLog({
+      entityType: "opportunity",
+      entityId: opportunity.id,
+      action: "updated",
+      changes,
+      userId: user.id,
+    });
+    void inngest.send({ name: "crm/opportunity.saved", data: { record_id: opportunity.id } });
+    revalidatePath("/[locale]/(routes)/crm/opportunities", "page");
+    return { data: serialize(opportunity) };
+  } catch (error) {
+    console.log("[UPDATE_OPPORTUNITY]", error);
+    return { error: "Failed to update opportunity" };
+  }
+};

@@ -1,0 +1,98 @@
+"use server";
+import { prismadb } from "@/lib/prisma";
+import { parseSpreadsheetFile } from "@/lib/spreadsheet/parse";
+import { requireAuthenticated } from "@/lib/authz";
+
+export async function importTargets(
+  formData: FormData
+): Promise<{ imported: number; skipped: number; errors: string[] }> {
+  // Plain bulk create; rows are owned by the importer. requireAuthenticated
+  // throws on no session, matching this function's throw-based contract.
+  const user = await requireAuthenticated();
+
+  const file = formData.get("file") as File | null;
+  if (!file) throw new Error("No file provided");
+
+  const mappingRaw = formData.get("mapping") as string | null;
+  const mapping: Record<string, string> = mappingRaw ? JSON.parse(mappingRaw) : {};
+
+  const data = await parseSpreadsheetFile(file);
+
+  const valid: any[] = [];
+  const errors: string[] = [];
+
+  data.forEach((rawRow, index) => {
+    const row: Record<string, string> = {};
+    if (Object.keys(mapping).length > 0) {
+      Object.entries(mapping).forEach(([csvCol, targetField]) => {
+        if (targetField && rawRow[csvCol] !== undefined) {
+          row[targetField] = rawRow[csvCol];
+        }
+      });
+    } else {
+      Object.assign(row, rawRow);
+    }
+
+    const last_name = row.last_name;
+    const email = row.email;
+    const mobile_phone = row.mobile_phone;
+    const company = row.company;
+
+    if (!last_name && !company) {
+      errors.push(`Row ${index + 2}: missing last_name or company`);
+      return;
+    }
+
+    valid.push({
+      last_name: last_name ?? "",
+      first_name: row.first_name || null,
+      email: email || null,
+      mobile_phone: mobile_phone || null,
+      office_phone: row.office_phone || null,
+      company: row.company || null,
+      position: row.position || null,
+      company_website: row.company_website || null,
+      personal_website: row.personal_website || null,
+      social_linkedin: row.social_linkedin || null,
+      social_x: row.social_x || null,
+      social_instagram: row.social_instagram || null,
+      social_facebook: row.social_facebook || null,
+      personal_email: row.personal_email || null,
+      company_email: row.company_email || null,
+      company_phone: row.company_phone || null,
+      city: row.city || null,
+      country: row.country || null,
+      industry: row.industry || null,
+      employees: row.employees || null,
+      description: row.description || null,
+      created_by: user.id,
+    });
+  });
+
+  if (valid.length > 0) {
+    // Inherit global suppression: a re-imported address that previously
+    // unsubscribed must never become emailable again via import.
+    const emails = valid.map((v) => v.email).filter(Boolean) as string[];
+    if (emails.length > 0) {
+      const suppressed = await prismadb.crm_Targets.findMany({
+        where: {
+          do_not_email: true,
+          email: { in: emails, mode: "insensitive" },
+        },
+        select: { email: true },
+      });
+      const suppressedEmails = new Set(
+        suppressed.map((s) => (s.email ?? "").toLowerCase())
+      );
+      for (const row of valid) {
+        if (row.email && suppressedEmails.has(row.email.toLowerCase())) {
+          row.do_not_email = true;
+          row.do_not_email_at = new Date();
+        }
+      }
+    }
+    await prismadb.crm_Targets.createMany({ data: valid, skipDuplicates: true });
+  }
+
+  return { imported: valid.length, skipped: errors.length, errors };
+}
